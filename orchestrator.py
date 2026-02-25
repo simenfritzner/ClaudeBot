@@ -235,6 +235,40 @@ async def run_agent_loop(
     planner_first_response = True if role == "planner" and not conversation_history else False
 
     try:
+        # If resuming from checkpoint, the last assistant message may have pending
+        # tool_use blocks that need tool_results before we can call Claude again.
+        if conversation_history and messages and messages[-1].get("role") == "assistant":
+            pending_tool_uses = []
+            last_content = messages[-1].get("content", [])
+            for block in last_content:
+                if hasattr(block, "type") and block.type == "tool_use":
+                    pending_tool_uses.append(block)
+
+            if pending_tool_uses:
+                tool_results = []
+                for tool_use in pending_tool_uses:
+                    if tool_use.name == "delegate_task":
+                        current_task = await db.get_task(task_id)
+                        spent = current_task["token_cost"] if current_task else 0.0
+                        remaining = budget - spent
+                        result_text = await handle_delegation(
+                            tool_use.input,
+                            parent_task_id=task_id,
+                            parent_depth=depth,
+                            parent_budget_remaining=remaining,
+                            progress_callback=progress_callback,
+                        )
+                    else:
+                        result_text = await execute_tool(tool_use.name, tool_use.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": result_text,
+                    })
+                messages.append({"role": "user", "content": tool_results})
+                step += 1
+                await db.update_task(task_id, step_count=step)
+
         while step < max_steps:
             step += 1
             await db.update_task(task_id, step_count=step)
