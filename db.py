@@ -7,11 +7,11 @@ import json
 import os
 from datetime import datetime, timezone
 
-from config import DB_PATH
+from config import DB_PATH, DEFAULT_TASK_BUDGET
 
 
 async def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, and migrate schema."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -30,7 +30,10 @@ async def init_db():
                 result      TEXT,
                 error       TEXT,
                 discord_message_id TEXT,
-                discord_channel_id TEXT
+                discord_channel_id TEXT,
+                parent_task_id TEXT,
+                depth       INTEGER DEFAULT 0,
+                budget      REAL DEFAULT 1.0
             );
 
             CREATE TABLE IF NOT EXISTS memory_session (
@@ -67,6 +70,18 @@ async def init_db():
                 budget_used_today REAL
             );
         """)
+
+        # Migrate existing DBs: add new columns if missing
+        for col, default in [
+            ("parent_task_id", "NULL"),
+            ("depth", "0"),
+            ("budget", str(DEFAULT_TASK_BUDGET)),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {'TEXT' if col == 'parent_task_id' else 'REAL' if col == 'budget' else 'INTEGER'} DEFAULT {default}")
+            except Exception:
+                pass  # column already exists
+
         await db.commit()
 
 
@@ -76,14 +91,18 @@ def _now() -> str:
 
 def _generate_task_id() -> str:
     now = datetime.now(timezone.utc)
-    date_part = now.strftime("%Y%m%d")
-    time_part = now.strftime("%H%M%S")
-    return f"t_{date_part}_{time_part}"
+    return f"t_{now.strftime('%Y%m%d_%H%M%S')}_{now.strftime('%f')[:4]}"
 
 
 # === Task Operations ===
 
-async def create_task(description: str, max_steps: int = 10) -> dict:
+async def create_task(
+    description: str,
+    max_steps: int = 10,
+    budget: float = DEFAULT_TASK_BUDGET,
+    depth: int = 0,
+    parent_task_id: str | None = None,
+) -> dict:
     """Create a new task and return it."""
     task = {
         "id": _generate_task_id(),
@@ -99,15 +118,37 @@ async def create_task(description: str, max_steps: int = 10) -> dict:
         "output_tokens": 0,
         "result": None,
         "error": None,
+        "parent_task_id": parent_task_id,
+        "depth": depth,
+        "budget": budget,
     }
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO tasks (id, created_at, updated_at, status, description, max_steps)
-               VALUES (:id, :created_at, :updated_at, :status, :description, :max_steps)""",
+            """INSERT INTO tasks (id, created_at, updated_at, status, description,
+               max_steps, parent_task_id, depth, budget)
+               VALUES (:id, :created_at, :updated_at, :status, :description,
+               :max_steps, :parent_task_id, :depth, :budget)""",
             task,
         )
         await db.commit()
     return task
+
+
+async def create_subtask(
+    description: str,
+    parent_task_id: str,
+    depth: int,
+    budget: float,
+    max_steps: int,
+) -> dict:
+    """Create a subtask linked to a parent."""
+    return await create_task(
+        description=description,
+        max_steps=max_steps,
+        budget=budget,
+        depth=depth,
+        parent_task_id=parent_task_id,
+    )
 
 
 async def update_task(task_id: str, **kwargs):
@@ -135,7 +176,7 @@ async def get_active_tasks() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM tasks WHERE status IN ('queued', 'in_progress', 'classifying') ORDER BY created_at"
+            "SELECT * FROM tasks WHERE status IN ('queued', 'in_progress', 'classifying', 'checkpoint') ORDER BY created_at"
         )
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -146,6 +187,71 @@ async def get_stale_tasks() -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM tasks WHERE status = 'in_progress'"
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_subtasks(parent_task_id: str) -> list[dict]:
+    """Get all direct subtasks of a parent task."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at",
+            (parent_task_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_subtask_count(parent_task_id: str) -> int:
+    """Count direct subtasks of a parent task."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?",
+            (parent_task_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0]
+
+
+async def cascade_cost_to_parent(child_task_id: str, cost: float):
+    """Walk up the parent chain adding cost to each ancestor."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        current_id = child_task_id
+        while True:
+            cursor = await db.execute(
+                "SELECT parent_task_id FROM tasks WHERE id = ?", (current_id,)
+            )
+            row = await cursor.fetchone()
+            if not row or not row["parent_task_id"]:
+                break
+            parent_id = row["parent_task_id"]
+            await db.execute(
+                "UPDATE tasks SET token_cost = token_cost + ?, updated_at = ? WHERE id = ?",
+                (cost, _now(), parent_id),
+            )
+            current_id = parent_id
+        await db.commit()
+
+
+async def get_task_tree(root_task_id: str) -> list[dict]:
+    """Return all descendants of a root task ordered by depth then created_at."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Recursive CTE to get all descendants
+        cursor = await db.execute(
+            """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM tasks WHERE id = ?
+                UNION ALL
+                SELECT t.id FROM tasks t
+                JOIN descendants d ON t.parent_task_id = d.id
+            )
+            SELECT t.* FROM tasks t
+            JOIN descendants d ON t.id = d.id
+            ORDER BY t.depth, t.created_at
+            """,
+            (root_task_id,),
         )
         return [dict(row) for row in await cursor.fetchall()]
 

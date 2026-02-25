@@ -20,17 +20,21 @@ from config import (
     CHANNEL_ERRORS,
     HEARTBEAT_INTERVAL_SECONDS,
 )
-from orchestrator import process_task, get_status, recover_stale_tasks
+from orchestrator import process_task, continue_task, get_status, recover_stale_tasks
 
 # === Bot Setup ===
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Channel cache (populated on_ready)
 channels = {}
+
+# Active planner checkpoints: message_id -> {task_id, conversation_history, budget}
+_pending_checkpoints: dict[int, dict] = {}
 
 
 def _get_channel(name: str) -> discord.TextChannel | None:
@@ -55,7 +59,7 @@ async def _send_to_channel(channel_name: str, content: str):
 @bot.event
 async def on_ready():
     """Called when bot connects to Discord."""
-    print(f"✅ {bot.user} is online")
+    print(f"{bot.user} is online")
 
     # Initialize database
     await db.init_db()
@@ -64,16 +68,16 @@ async def on_ready():
     for guild in bot.guilds:
         for channel in guild.text_channels:
             channels[channel.name] = channel
-            
+
     print(f"Found channels: {list(channels.keys())}")
     # Crash recovery
     recovered = await recover_stale_tasks()
     if recovered:
         for msg in recovered:
             await _send_to_channel(CHANNEL_ERRORS, msg)
-        await _send_to_channel(CHANNEL_STATUS, f"🔄 Bot restarted. Recovered {len(recovered)} stale task(s).")
+        await _send_to_channel(CHANNEL_STATUS, f"Bot restarted. Recovered {len(recovered)} stale task(s).")
     else:
-        await _send_to_channel(CHANNEL_STATUS, "🟢 Bot online. No stale tasks found.")
+        await _send_to_channel(CHANNEL_STATUS, "Bot online. No stale tasks found.")
 
     # Start heartbeat
     if not heartbeat_loop.is_running():
@@ -107,42 +111,135 @@ async def on_message(message: discord.Message):
         return
 
     # Acknowledge
-    await message.add_reaction("🔄")
+    await message.add_reaction("\U0001f504")  # 🔄
+
+    # Progress callback for subtask notifications
+    async def _progress_cb(event: str, data: dict):
+        if event == "subtask_completed":
+            status_icon = {
+                "completed": "\u2705",
+                "failed": "\u274c",
+                "stalled": "\u26a0\ufe0f",
+            }.get(data.get("status", ""), "\u2705")
+            await message.channel.send(
+                f"> {status_icon} Subtask done: {data['description'][:80]} (${data['cost']:.4f})"
+            )
 
     # Process the task
-    result = await process_task(task_description)
+    result = await process_task(task_description, progress_callback=_progress_cb)
 
     # Remove processing reaction
     try:
-        await message.remove_reaction("🔄", bot.user)
+        await message.remove_reaction("\U0001f504", bot.user)
     except discord.errors.NotFound:
         pass
 
     # Handle result
     if result.status == "completed":
-        await message.add_reaction("✅")
-        # Send response in the same channel
+        await message.add_reaction("\u2705")  # ✅
         await _send_long_message(message.channel, result.response)
 
     elif result.status == "checkpoint":
-        await message.add_reaction("⏸️")
-        checkpoint_msg = f"🔔 **Checkpoint** ({result.checkpoint_reason})\n\n{result.response}\n\n→ Reply to continue, or react ❌ to cancel."
-        await message.reply(checkpoint_msg)
+        await message.add_reaction("\u23f8\ufe0f")  # ⏸️
+
+        if result.conversation_history:
+            # Planner checkpoint — show plan and wait for reaction approval
+            plan_msg = (
+                f"**Plan ready** ({result.checkpoint_reason})\n\n"
+                f"{result.response}\n\n"
+                f"React \u2705 to approve or \u274c to cancel."
+            )
+            plan_message = await message.reply(plan_msg)
+
+            # Add reactions for approval
+            await plan_message.add_reaction("\u2705")
+            await plan_message.add_reaction("\u274c")
+
+            # Store checkpoint state
+            _pending_checkpoints[plan_message.id] = {
+                "task_id": result.task_id,
+                "conversation_history": result.conversation_history,
+                "budget": float(result.response.split("$")[0]) if "$" in result.response else 1.0,
+                "original_message": message,
+                "progress_cb": _progress_cb,
+            }
+            # Retrieve actual budget from DB
+            task = await db.get_task(result.task_id)
+            if task:
+                _pending_checkpoints[plan_message.id]["budget"] = task["budget"]
+
+        else:
+            # Regular checkpoint (uncertainty)
+            checkpoint_msg = (
+                f"**Checkpoint** ({result.checkpoint_reason})\n\n"
+                f"{result.response}\n\n"
+                f"Reply to continue, or react \u274c to cancel."
+            )
+            await message.reply(checkpoint_msg)
 
     elif result.status == "failed":
-        await message.add_reaction("❌")
+        await message.add_reaction("\u274c")  # ❌
         await message.reply(result.response)
         await _send_to_channel(CHANNEL_ERRORS, f"Task `{result.task_id}` failed:\n{result.response}")
 
     elif result.status == "stalled":
-        await message.add_reaction("⚠️")
+        await message.add_reaction("\u26a0\ufe0f")  # ⚠️
         await message.reply(result.response)
+
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    """Handle reactions for planner checkpoint approval."""
+    if user == bot.user:
+        return
+
+    message_id = reaction.message.id
+    if message_id not in _pending_checkpoints:
+        return
+
+    checkpoint = _pending_checkpoints[message_id]
+    emoji = str(reaction.emoji)
+
+    if emoji == "\u2705":
+        # Approved — continue the planner
+        del _pending_checkpoints[message_id]
+
+        original = checkpoint["original_message"]
+        await original.add_reaction("\U0001f504")  # 🔄
+
+        result = await continue_task(
+            task_id=checkpoint["task_id"],
+            conversation_history=checkpoint["conversation_history"],
+            budget=checkpoint["budget"],
+            progress_callback=checkpoint["progress_cb"],
+        )
+
+        try:
+            await original.remove_reaction("\U0001f504", bot.user)
+        except discord.errors.NotFound:
+            pass
+
+        if result.status == "completed":
+            await original.add_reaction("\u2705")
+            await _send_long_message(original.channel, result.response)
+        elif result.status == "failed":
+            await original.add_reaction("\u274c")
+            await original.reply(result.response)
+        elif result.status == "stalled":
+            await original.add_reaction("\u26a0\ufe0f")
+            await original.reply(result.response)
+
+    elif emoji == "\u274c":
+        # Rejected — cancel the task
+        del _pending_checkpoints[message_id]
+        await db.update_task(checkpoint["task_id"], status="failed", error="User rejected plan")
+        await reaction.message.reply("Plan rejected. Task cancelled.")
 
 
 async def _send_long_message(channel, content: str):
     """Send a message, splitting into chunks if needed. Uses embeds for long content."""
     if not content:
-        await channel.send("✅ Task completed (no text output).")
+        await channel.send("Task completed (no text output).")
         return
 
     if len(content) <= 1990:
@@ -173,30 +270,48 @@ async def cmd_cost(ctx):
     """Show cost breakdown."""
     daily = await db.get_daily_cost()
     monthly = await db.get_monthly_cost()
-    await ctx.send(
-        f"💰 **Cost Report**\n"
-        f"Today: ${daily:.4f}\n"
-        f"This month: ${monthly:.4f}"
-    )
+
+    # Show active task budgets
+    active = await db.get_active_tasks()
+    lines = [
+        f"**Cost Report**",
+        f"Today: ${daily:.4f}",
+        f"This month: ${monthly:.4f}",
+    ]
+    root_tasks = [t for t in active if not t.get("parent_task_id")]
+    if root_tasks:
+        lines.append("\n**Active task budgets:**")
+        for t in root_tasks:
+            lines.append(f"`{t['id']}` ${t['token_cost']:.4f} / ${t['budget']:.2f} — {t['description'][:50]}")
+
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="tasks")
 async def cmd_tasks(ctx):
-    """Show active tasks."""
+    """Show active tasks with tree structure."""
     active = await db.get_active_tasks()
     if not active:
         await ctx.send("No active tasks.")
         return
-    lines = []
+
+    # Build tree view
+    lines = ["**Active Tasks**"]
     for t in active:
-        lines.append(f"`{t['id']}` [{t['status']}] {t['description'][:60]}")
-    await ctx.send("📋 **Active Tasks**\n" + "\n".join(lines))
+        depth = t.get("depth", 0)
+        indent = "  " * depth
+        budget_str = f"${t.get('budget', 0):.2f}" if depth == 0 else f"${t.get('token_cost', 0):.4f}"
+        status = t["status"]
+        desc = t["description"][:60]
+        lines.append(f"{indent}`{t['id']}` [{status}] {budget_str} {desc}")
+
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="ping")
 async def cmd_ping(ctx):
     """Check bot latency."""
-    await ctx.send(f"🏓 Pong! Latency: {round(bot.latency * 1000)}ms")
+    await ctx.send(f"Pong! Latency: {round(bot.latency * 1000)}ms")
 
 
 @bot.command(name="help_bot")
@@ -207,19 +322,21 @@ async def cmd_help_bot(ctx):
 **Just type naturally** in #commands or DMs to give tasks:
 > "Summarize chapter 3"
 > "Run FFT analysis on data/signal.csv"
-> "Write the methodology section"
+> "$5 Write the methodology section"
+
+**Budget prefix:** `$N <task>` to set budget (default $1.00)
+> `$15 go through results and run new experiments`
 
 **Prefix commands:**
 `!status` — Bot status and budget
 `!cost` — Cost breakdown
-`!tasks` — Active task queue
+`!tasks` — Active task queue (tree view)
 `!ping` — Check latency
 `!help_bot` — This message
 
 **Modifiers:**
 `!sonnet <task>` — Force Sonnet model
 `!haiku <task>` — Force Haiku model
-`!auto <task>` — Run without checkpoints
 """
     embed = discord.Embed(description=help_text, color=0x3498DB)
     await ctx.send(embed=embed)
@@ -241,7 +358,7 @@ async def heartbeat_loop():
         status_ch = _get_channel(CHANNEL_STATUS)
         if status_ch:
             await status_ch.send(
-                f"🫀 Alive | Queue: {queued} | Active: {in_progress} | Today: ${daily:.4f}"
+                f"Alive | Queue: {queued} | Active: {in_progress} | Today: ${daily:.4f}"
             )
     except Exception as e:
         print(f"Heartbeat error: {e}")
@@ -256,7 +373,7 @@ async def before_heartbeat():
 
 def main():
     if not DISCORD_TOKEN:
-        print("❌ DISCORD_TOKEN not set in .env")
+        print("DISCORD_TOKEN not set in .env")
         return
     bot.run(DISCORD_TOKEN)
 

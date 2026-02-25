@@ -8,6 +8,7 @@ from config import (
     ANTHROPIC_API_KEY,
     MODEL_HAIKU,
     MODEL_SONNET,
+    MODEL_SONNET_LATEST,
     MAX_INPUT_TOKENS,
     MAX_OUTPUT_TOKENS,
     PRICING,
@@ -23,10 +24,17 @@ SONNET — thesis writing, analysis, experiment design, code debugging, multi-st
 Task: {task_description}"""
 
 
-async def classify_task(description: str) -> tuple[str, str, int, int]:
+async def classify_task(
+    description: str,
+    force_model: str | None = None,
+) -> tuple[str, str, int, int]:
     """
     Classify a task and return (model, tier, max_input, max_output).
     Uses Haiku for the classification itself.
+
+    Args:
+        description: Task description to classify
+        force_model: Optional model override — skip classification entirely
 
     Returns:
         model: The model string to use
@@ -34,7 +42,13 @@ async def classify_task(description: str) -> tuple[str, str, int, int]:
         max_input: Max input tokens for the task
         max_output: Max output tokens for the task
     """
-    # Check for user overrides
+    # Direct model override (used by orchestrator for planners/forced models)
+    if force_model:
+        if force_model == MODEL_HAIKU:
+            return MODEL_HAIKU, "simple", MAX_INPUT_TOKENS["simple"], MAX_OUTPUT_TOKENS["simple"]
+        return force_model, "complex", MAX_INPUT_TOKENS["complex"], MAX_OUTPUT_TOKENS["complex"]
+
+    # Check for user overrides in description
     lower = description.lower()
     if lower.startswith("!sonnet"):
         description = description[7:].strip()
@@ -54,14 +68,11 @@ async def classify_task(description: str) -> tuple[str, str, int, int]:
         )
 
         classification = response.content[0].text.strip().upper()
-        input_usage = response.usage.input_tokens
-        output_usage = response.usage.output_tokens
 
         if "HAIKU" in classification:
             return MODEL_HAIKU, "simple", MAX_INPUT_TOKENS["simple"], MAX_OUTPUT_TOKENS["simple"]
         else:
             # Default to Sonnet for anything non-trivial
-            # Determine tier based on description length/complexity
             if len(description) > 500 or any(kw in lower for kw in ["write", "analyze", "design", "debug", "compare", "explain"]):
                 return MODEL_SONNET, "complex", MAX_INPUT_TOKENS["complex"], MAX_OUTPUT_TOKENS["complex"]
             return MODEL_SONNET, "standard", MAX_INPUT_TOKENS["standard"], MAX_OUTPUT_TOKENS["standard"]

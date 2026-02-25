@@ -3,11 +3,17 @@ Thesis Bot — Context Manager
 Assembles context for each API call from the three-tier memory system.
 """
 import json
+import os
+
 from config import (
     SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    WORKER_SYSTEM_PROMPT,
+    PLANNER_RESERVE_BUDGET,
     MAX_SESSION_MEMORIES_INJECTED,
     MAX_LONGTERM_MEMORIES_INJECTED,
     THESIS_DIR,
+    CONTEXT_FILE_MAX_LINES,
 )
 import db
 
@@ -26,7 +32,7 @@ def _format_memory(mem: dict) -> str:
 
 
 async def build_system_prompt(tools_description: str = "") -> str:
-    """Build the system prompt with injected context."""
+    """Build the system prompt with injected context (for root-level workers)."""
     # Get recent session memories
     recent = await db.get_recent_session_memories(limit=MAX_SESSION_MEMORIES_INJECTED)
     recent_text = "\n".join(_format_memory(m) for m in recent) if recent else "No recent tasks."
@@ -38,6 +44,31 @@ async def build_system_prompt(tools_description: str = "") -> str:
         tools=tools_description or "Standard tools available.",
         thesis_state=thesis_state,
         recent_context=recent_text,
+    )
+
+
+async def build_planner_prompt(tools_description: str, budget: float) -> str:
+    """Build the system prompt for a planner agent."""
+    # Planner benefits from knowing recent work
+    recent = await db.get_recent_session_memories(limit=MAX_SESSION_MEMORIES_INJECTED)
+    recent_text = ""
+    if recent:
+        memories = "\n".join(_format_memory(m) for m in recent)
+        recent_text = f"\n\nRECENT WORK:\n{memories}"
+
+    prompt = PLANNER_SYSTEM_PROMPT.format(
+        tools=tools_description,
+        budget=f"{budget:.2f}",
+        reserve=f"{PLANNER_RESERVE_BUDGET:.2f}",
+    )
+    return prompt + recent_text
+
+
+def build_worker_prompt(tools_description: str, budget: float) -> str:
+    """Build the system prompt for a worker sub-agent (minimal, no memory)."""
+    return WORKER_SYSTEM_PROMPT.format(
+        tools=tools_description,
+        budget=f"{budget:.2f}",
     )
 
 
@@ -72,6 +103,33 @@ async def build_messages(
     # Add the current task
     messages.append({"role": "user", "content": task_description})
 
+    return messages
+
+
+def build_subtask_messages(
+    description: str,
+    context_files: list[str] | None = None,
+) -> list[dict]:
+    """Build messages for a subtask (no memory, just context files + description)."""
+    messages = []
+
+    if context_files:
+        context_parts = []
+        for filepath in context_files[:3]:  # max 3 files
+            resolved = filepath if os.path.isabs(filepath) else os.path.join(THESIS_DIR, filepath)
+            try:
+                with open(resolved, "r") as f:
+                    lines = f.readlines()[:CONTEXT_FILE_MAX_LINES]
+                content = "".join(lines)
+                context_parts.append(f"[{filepath}]:\n{content}")
+            except (FileNotFoundError, UnicodeDecodeError, PermissionError):
+                context_parts.append(f"[{filepath}]: (could not read file)")
+
+        if context_parts:
+            messages.append({"role": "user", "content": "Context files:\n\n" + "\n\n".join(context_parts)})
+            messages.append({"role": "assistant", "content": "I've read the context files. What's the task?"})
+
+    messages.append({"role": "user", "content": description})
     return messages
 
 

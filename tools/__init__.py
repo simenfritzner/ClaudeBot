@@ -2,10 +2,12 @@
 Thesis Bot — Tools
 Tool definitions for Claude's tool use and their implementations.
 """
+from config import MAX_DELEGATION_DEPTH
 from tools.file_ops import FILE_TOOLS, handle_file_tool
 from tools.scripts import SCRIPT_TOOLS, handle_script_tool
+from tools.delegation import DELEGATION_TOOLS
 
-# All tool definitions (sent to Claude)
+# All base tool definitions (sent to Claude)
 ALL_TOOLS = FILE_TOOLS + SCRIPT_TOOLS
 
 # Tool name → handler mapping
@@ -14,6 +16,22 @@ for tool in FILE_TOOLS:
     TOOL_HANDLERS[tool["name"]] = handle_file_tool
 for tool in SCRIPT_TOOLS:
     TOOL_HANDLERS[tool["name"]] = handle_script_tool
+
+
+def get_tools_for_depth(depth: int) -> list[dict]:
+    """Return tool definitions available at a given depth."""
+    if depth < MAX_DELEGATION_DEPTH:
+        return ALL_TOOLS + DELEGATION_TOOLS
+    return ALL_TOOLS
+
+
+def get_tools_description_for_depth(depth: int) -> str:
+    """Get a human-readable description of tools available at a given depth."""
+    tools = get_tools_for_depth(depth)
+    lines = []
+    for tool in tools:
+        lines.append(f"- {tool['name']}: {tool['description']}")
+    return "\n".join(lines)
 
 
 async def execute_tool(name: str, input_data: dict) -> str:
