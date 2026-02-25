@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for the service -->
+    <key>Label</key>
+    <string>com.simenfritzner.thesisbot</string>
+
+    <!-- The command to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot/venv/bin/python</string>
+        <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot/bot.py</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot</string>
+
+    <!-- Environment variables (loads .env via python-dotenv, but THESIS_DIR needs to be here too for tools) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Start on login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash (wait 10 seconds) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Wait 10 seconds before restarting -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot/data/logs/bot-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/simenfritzner/Documents/Skole/Semester 9/Apple-Catcher/thesis-bot/ClaudeBot/data/logs/bot-stderr.log</string>
+</dict>
+</plist>
