@@ -75,9 +75,9 @@ async def on_ready():
     if recovered:
         for msg in recovered:
             await _send_to_channel(CHANNEL_ERRORS, msg)
-        await _send_to_channel(CHANNEL_STATUS, f"Bot restarted. Recovered {len(recovered)} stale task(s).")
+        await _send_to_channel(CHANNEL_STATUS, f"🔄 Bot restarted. Recovered {len(recovered)} stale task(s).")
     else:
-        await _send_to_channel(CHANNEL_STATUS, "Bot online. No stale tasks found.")
+        await _send_to_channel(CHANNEL_STATUS, "🟢 Bot online. No stale tasks found.")
 
     # Start heartbeat
     if not heartbeat_loop.is_running():
@@ -358,7 +358,7 @@ async def heartbeat_loop():
         status_ch = _get_channel(CHANNEL_STATUS)
         if status_ch:
             await status_ch.send(
-                f"Alive | Queue: {queued} | Active: {in_progress} | Today: ${daily:.4f}"
+                f"🫀 Alive | Queue: {queued} | Active: {in_progress} | Today: ${daily:.4f}"
             )
     except Exception as e:
         print(f"Heartbeat error: {e}")

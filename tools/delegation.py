@@ -123,10 +123,11 @@ async def handle_delegation(
             "status": result.status,
         })
 
-    # Truncate result for the parent context
+    # Truncate result for the parent context — keep short to avoid blowing up
+    # the planner's input tokens on subsequent calls
     response = result.response or "(no output)"
-    if len(response) > 3000:
-        response = response[:2900] + f"\n\n... [truncated, {len(response)} chars total]"
+    if len(response) > 500:
+        response = response[:450] + f"\n... [truncated, {len(response)} chars total]"
 
     status_prefix = f"[{result.status}] " if result.status != "completed" else ""
     return f"{status_prefix}Subtask result (${child_cost:.4f}):\n{response}"

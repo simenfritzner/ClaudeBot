@@ -5,6 +5,7 @@ manages checkpoints, delegates subtasks, and summarizes results.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import json
 from typing import Any, Callable, Coroutine
@@ -44,6 +45,31 @@ from tools import (
 from tools.delegation import handle_delegation
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# Rate limit retry config
+_MAX_RETRIES = 5
+_BASE_DELAY = 15.0  # seconds — 30k tokens/min limit means ~1 call per cycle
+
+
+async def _call_claude_with_retry(*, model, max_tokens, system, messages, tools) -> anthropic.types.Message:
+    """Call Claude API with exponential backoff on rate limit (429) errors."""
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
+        except anthropic.RateLimitError as e:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            delay = _BASE_DELAY * (2 ** attempt)
+            print(f"Rate limited (attempt {attempt + 1}/{_MAX_RETRIES}), retrying in {delay:.0f}s...")
+            await asyncio.sleep(delay)
+    raise RuntimeError("Unreachable")
+
 
 # Budget-parsing regex: $15 or $2.50 at start of message
 _BUDGET_RE = re.compile(r"^\$(\d+\.?\d*)\s+")
@@ -291,8 +317,8 @@ async def run_agent_loop(
                     f"Daily budget limit (${COST_LIMIT_DAILY:.2f}) reached. Total today: ${daily_cost:.4f}.",
                 )
 
-            # Call Claude
-            response = await client.messages.create(
+            # Call Claude (with retry on rate limit)
+            response = await _call_claude_with_retry(
                 model=model,
                 max_tokens=max_output,
                 system=system_prompt,
